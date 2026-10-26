@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>素材采集器</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="logo">◉</span>
+      <div>
+        <strong>素材采集器</strong>
+        <small>混剪素材 · 采集与归档</small>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item active" data-view="collect">
+        <span class="ico">⌕</span> 采集
+      </button>
+      <button class="nav-item" data-view="results">
+        <span class="ico">▦</span> 结果
+        <em id="nav-result-count" class="badge hidden">0</em>
+      </button>
+      <button class="nav-item" data-view="library">
+        <span class="ico">▤</span> 素材库
+      </button>
+      <button class="nav-item" data-view="copy">
+        <span class="ico">✎</span> 文案·评论
+      </button>
+      <button class="nav-item" data-view="transcribe">
+        <span class="ico">◍</span> 视频转写
+      </button>
+      <button class="nav-item" data-view="browser">
+        <span class="ico">◫</span> 内置浏览器
+      </button>
+      <button class="nav-item" data-view="settings">
+        <span class="ico">⚙</span> 设置
+      </button>
+    </nav>
+
+    <div class="side-footer">
+      <div class="browser-state" id="browser-state">
+        <i class="dot"></i><span>内核就绪</span>
+      </div>
+      <div class="side-login" id="side-login"></div>
+      <small class="hint">登录、搜索都在软件窗口内完成，不打开外部浏览器</small>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- 采集 -->
+    <section class="view active" id="view-collect">
+      <header class="view-head">
+        <h1>采集</h1>
+        <p>选平台、输关键词，工具会在专用浏览器里自动翻页搜索，把素材抓进素材库。</p>
+      </header>
+
+      <div class="card">
+        <div class="field">
+          <label>平台</label>
+          <div class="platforms" id="platform-picker"></div>
+        </div>
+
+        <div class="field">
+          <label>关键词<small>一行一个，同时开多个任务</small></label>
+          <textarea id="keywords" rows="5" placeholder="城市夜景&#10;空镜 转场&#10;雨夜 街道"></textarea>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>目标条数<small>每个关键词</small></label>
+            <input type="number" id="target" min="5" max="500" value="50" />
+          </div>
+          <div class="field grow">
+            <label>登录状态</label>
+            <div class="login-status" id="login-status">
+              <span class="muted">检查中…</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn primary" id="btn-start">开始采集</button>
+          <button class="btn ghost" id="btn-check-login">刷新登录状态</button>
+        </div>
+      </div>
+
+      <h2 class="section-title">采集任务</h2>
+      <div class="job-list" id="job-list">
+        <div class="empty">还没有任务</div>
+      </div>
+    </section>
+
+    <!-- 结果 -->
+    <section class="view" id="view-results">
+      <header class="view-head">
+        <h1>结果</h1>
+        <p>采集到的素材，勾选后下载到素材库。</p>
+      </header>
+
+      <div class="dl-strip hidden" id="dl-strip">
+        <div class="dl-info" id="dl-info">下载中…</div>
+        <div class="dl-bar"><div class="dl-fill" id="dl-fill"></div></div>
+      </div>
+
+      <div class="toolbar">
+        <select id="filter-platform">
+          <option value="">全部平台</option>
+        </select>
+        <select id="filter-keyword">
+          <option value="">全部关键词</option>
+        </select>
+        <select id="filter-status">
+          <option value="">全部状态</option>
+          <option value="new">未下载</option>
+          <option value="done">已下载</option>
+          <option value="error">失败</option>
+        </select>
+        <select id="sort-by">
+          <option value="new">最新采集</option>
+          <option value="likes">点赞最多</option>
+          <option value="duration">时长最长</option>
+        </select>
+        <input type="search" id="search-q" placeholder="搜标题 / 文案 / 作者" />
+        <div class="spacer"></div>
+        <button class="btn ghost small" id="btn-select-all">全选本页</button>
+        <button class="btn ghost small" id="btn-download-selected">下载选中 (<span id="selected-count">0</span>)</button>
+      </div>
+
+      <div class="grid" id="result-grid"></div>
+      <div class="pager" id="result-pager"></div>
+    </section>
+
+    <!-- 素材库 -->
+    <section class="view" id="view-library">
+      <header class="view-head">
+        <h1>素材库</h1>
+        <p id="library-summary">—</p>
+      </header>
+
+      <div class="toolbar">
+        <select id="lib-platform">
+          <option value="">全部平台</option>
+        </select>
+        <input type="search" id="lib-q" placeholder="搜标题 / 作者 / 标签" />
+        <div class="spacer"></div>
+        <button class="btn ghost small" id="btn-open-folder">打开素材目录</button>
+        <button class="btn ghost small" id="btn-export">导出清单 CSV</button>
+      </div>
+
+      <div class="grid" id="library-grid"></div>
+    </section>
+
+    <!-- 文案·评论 -->
+    <section class="view" id="view-copy">
+      <header class="view-head">
+        <h1>文案·评论</h1>
+        <p>搜一批爆款文案、采视频评论区，再用 AI 改写仿写、总结痛点。</p>
+      </header>
+
+      <div class="card">
+        <div class="field">
+          <label>平台</label>
+          <div class="platforms" id="copy-platform-picker"></div>
+        </div>
+        <div class="field">
+          <label>关键词<small>一行一个，搜同主题爆款文案</small></label>
+          <textarea id="copy-keywords" rows="3" placeholder="健身餐&#10;租房改造"></textarea>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>文案条数<small>每个关键词</small></label>
+            <input type="number" id="copy-target" min="5" max="200" value="30" />
+          </div>
+          <div class="field grow">
+            <label class="check-line"><input type="checkbox" id="copy-with-comments" /> 同时采评论（含二级回复，进详情页较慢）</label>
+          </div>
+          <div class="field">
+            <label>每条评论上限</label>
+            <input type="number" id="copy-cmt-limit" min="10" max="300" value="50" />
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="btn-copy-start">开始采集</button>
+        </div>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:10px;margin:6px 0">
+        <span class="muted small" id="copy-job-summary"></span>
+        <button class="btn ghost small" id="btn-clear-stuck">清理卡住的任务</button>
+      </div>
+      <div class="job-list" id="copy-job-list"></div>
+
+      <div class="toolbar copy-toolbar">
+        <div class="tabs">
+          <button class="tab active" data-tab="copies">文案库</button>
+          <button class="tab" data-tab="comments">评论库</button>
+        </div>
+        <select id="copy-filter-platform">
+          <option value="">全部平台</option>
+        </select>
+        <select id="copy-filter-keyword">
+          <option value="">全部关键词</option>
+        </select>
+        <input type="search" id="copy-q" placeholder="搜文案 / 评论" />
+        <div class="spacer"></div>
+        <span id="copy-selected-count" class="muted small">已选 0</span>
+        <button class="btn ghost small" id="btn-copy-select-all">全选本页</button>
+      </div>
+
+      <div class="ai-bar" id="ai-bar">
+        <span class="ai-label">AI 加工：</span>
+        <button class="btn small ai-btn" data-action="rewrite">改写文案</button>
+        <button class="btn small ai-btn" data-action="hooks">提炼钩子</button>
+        <button class="btn small ai-btn" data-action="commentSummary">总结评论</button>
+        <button class="btn small ai-btn" data-action="script">混剪脚本</button>
+        <button class="btn small ai-btn" data-action="custom">自定义</button>
+        <input type="text" id="ai-theme" placeholder="仿写主题（仿写用）" class="ai-theme" />
+      </div>
+
+      <div id="copy-pane-copies" class="copy-list"></div>
+      <div id="copy-pane-comments" class="copy-list hidden"></div>
+    </section>
+
+    <!-- 视频转写 -->
+    <section class="view" id="view-transcribe">
+      <header class="view-head">
+        <h1>视频转写</h1>
+        <p>把已下载素材里的说话/口播转成带时间轴的文字，再交给 AI 提炼要点、写脚本。</p>
+      </header>
+
+      <div class="card">
+        <div class="field-row">
+          <div class="field">
+            <label>语言<small>留空自动识别</small></label>
+            <select id="tr-language">
+              <option value="zh">中文</option>
+              <option value="en">英文</option>
+              <option value="">自动识别</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>模型</label>
+            <select id="tr-model">
+              <option value="medium">medium（默认，准）</option>
+              <option value="small">small（快）</option>
+              <option value="large-v3">large-v3（最准，慢）</option>
+            </select>
+          </div>
+          <div class="field grow">
+            <label>转写服务状态</label>
+            <div class="hint" id="tr-service-status">检查中…</div>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field grow">
+            <label>转写范围<small>默认只转已下载素材；勾「仅取音频」可连没下载的一起转</small></label>
+            <div class="check-line">
+              <select id="tr-scope">
+                <option value="pending">所有「未转写」的素材</option>
+                <option value="platform">按平台筛选</option>
+              </select>
+              <select id="tr-scope-platform" class="hidden">
+                <option value="">全部平台</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label>本次条数上限</label>
+            <input type="number" id="tr-limit" min="1" max="50" value="5" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label class="check-line">
+            <input type="checkbox" id="tr-audio-only" /> 不下载视频，只取音频转写（省空间，适合「只要内容文字」）
+          </label>
+          <label class="check-line">
+            <input type="checkbox" id="tr-drop-after" /> 转写完删掉音频文件，只留文字（长期占用接近 0）
+          </label>
+        </div>
+
+        <div class="actions">
+          <button class="btn primary" id="btn-tr-start">开始转写</button>
+          <button class="btn ghost" id="btn-tr-restart">重启转写服务</button>
+        </div>
+      </div>
+
+      <div class="job-list" id="tr-job-list"></div>
+
+      <div class="toolbar">
+        <select id="tr-filter-platform">
+          <option value="">全部平台</option>
+        </select>
+        <input type="search" id="tr-q" placeholder="搜转写文本 / 标题" />
+        <div class="spacer"></div>
+        <span id="tr-selected-count" class="muted small">已选 0</span>
+        <button class="btn ghost small" id="btn-tr-refresh">刷新</button>
+      </div>
+
+      <div class="ai-bar" id="tr-ai-bar">
+        <span class="ai-label">AI 加工：</span>
+        <button class="btn small ai-btn" data-tra="speechPoints">提炼口播要点</button>
+        <button class="btn small ai-btn" data-tra="speechScript">口播转混剪脚本</button>
+        <button class="btn small ai-btn" data-tra="custom">自定义</button>
+      </div>
+
+      <div id="tr-list" class="copy-list"></div>
+    </section>
+
+    <!-- 内置浏览器 -->
+    <section class="view" id="view-browser">      <div class="browser-bar">
+        <button class="btn ghost small" id="bw-back" title="后退">←</button>
+        <button class="btn ghost small" id="bw-forward" title="前进">→</button>
+        <button class="btn ghost small" id="bw-reload" title="刷新">⟳</button>
+        <div class="quick-platforms" id="bw-quick"></div>
+        <input type="text" id="bw-url" class="bw-url" placeholder="输入网址或选上面的平台" spellcheck="false" />
+        <button class="btn small" id="bw-go">打开</button>
+        <button class="btn ghost small" id="bw-login-check">检测登录</button>
+        <button class="btn small hidden" id="bw-task-view">看任务画面</button>
+        <button class="btn ghost small" id="bw-mute" title="内置浏览器声音">🔇 静音中</button>
+      </div>
+      <div class="login-strip" id="bw-login-strip"></div>
+      <div class="browser-pane" id="browser-pane">
+        <div class="pane-placeholder" id="pane-placeholder">
+          <div class="ph-icon">◫</div>
+          <p>上面的平台按钮或地址栏打开网页</p>
+          <p class="muted">在这里扫码登录后，回「采集」页开工</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="view" id="view-settings">
+      <header class="view-head">
+        <h1>设置</h1>
+        <p>下载目录、并发与采集节奏。</p>
+      </header>
+
+      <div class="card narrow">
+        <div class="field">
+          <label>下载目录</label>
+          <input type="text" id="set-downloadDir" />
+          <small class="hint">按「平台/关键词」自动建子文件夹</small>
+        </div>
+        <div class="field">
+          <label>Webhook 通知地址<small>任务/下载完成时 POST 事件到这个地址（给外部软件用，可留空）</small></label>
+          <input type="text" id="set-webhookUrl" placeholder="http://127.0.0.1:xxxx/webhook" />
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>并发下载数</label>
+            <input type="number" id="set-concurrency" min="1" max="6" />
+          </div>
+          <div class="field">
+            <label>默认条数</label>
+            <input type="number" id="set-defaultTarget" min="5" max="500" />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>滚动间隔最小(ms)</label>
+            <input type="number" id="set-delayMin" min="200" max="10000" />
+          </div>
+          <div class="field">
+            <label>滚动间隔最大(ms)</label>
+            <input type="number" id="set-delayMax" min="200" max="20000" />
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="btn-save-settings">保存设置</button>
+        </div>
+      </div>
+
+      <div class="card narrow">
+        <h3>AI 模型接口（文案加工用）</h3>
+        <div class="field">
+          <label>接口地址<small>OpenAI 兼容，如 http://127.0.0.1:3000/v1</small></label>
+          <input type="text" id="set-aiBaseUrl" placeholder="http://127.0.0.1:3000/v1" />
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>API Key</label>
+            <input type="password" id="set-aiApiKey" placeholder="sk-…（本地服务可留空）" />
+          </div>
+          <div class="field">
+            <label>模型名</label>
+            <input type="text" id="set-aiModel" placeholder="deepseek-chat / gpt-4o-mini…" />
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn ghost small" id="btn-ai-models">拉取模型列表</button>
+          <button class="btn ghost small" id="btn-ai-test">测试连接</button>
+        </div>
+        <div id="ai-config-status" class="hint"></div>
+      </div>
+
+      <div class="card narrow">
+        <h3>工具链检查</h3>
+        <div id="tool-status" class="tool-status">检查中…</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 预览弹窗 -->
+  <div class="modal" id="preview-modal">
+    <div class="modal-body">
+      <button class="modal-close" id="modal-close">✕</button>
+      <div id="preview-content"></div>
+    </div>
+  </div>
+
+  <div class="toast-wrap" id="toast-wrap"></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
