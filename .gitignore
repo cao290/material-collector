@@ -1,0 +1,31 @@
+# ---------- 依赖 ----------
+node_modules/
+
+# ---------- 登录态 / 敏感数据（绝对不能提交）----------
+# Electron 分区：含四平台登录 cookie
+profile-electron/
+# 登录态备份：明文 cookie（B站/抖音/小红书/快手）
+data/login-backup/
+# 运行库与设置：含本机路径、可能的 API Key
+data/settings.json
+
+# ---------- 运行期产物 ----------
+data/library.db
+data/library.db-shm
+data/library.db-wal
+data/*.log
+data/_tts_test.mp3
+data/_bak_*/
+data/nul
+# 平台探针产物（可随时用 scripts/probe.mjs 重新生成）
+probe-out/
+
+# ---------- Python ----------
+__pycache__/
+*.pyc
+
+# ---------- 编辑器 / 系统 ----------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
