@@ -109,6 +109,12 @@ $$('.nav-item').forEach((btn) => {
       await hideBrowserPane();
     }
     if (btn.dataset.view === 'results') loadResults();
+    if (btn.dataset.view === 'downloads') {
+      loadDownloadCenter();
+      // 进下载中心就把轮询挂上，否则页面是静态快照，
+      // 下载进度/速度永远停在打开那一刻的样子。
+      startDlPolling();
+    }
     if (btn.dataset.view === 'library') loadLibrary();
     if (btn.dataset.view === 'copy') loadCopyData();
     if (btn.dataset.view === 'settings') loadSettings();
@@ -224,6 +230,45 @@ async function pollPaneState() {
     const input = $('#bw-url');
     // 用户正在地址栏打字时不覆盖
     if (st.url && document.activeElement !== input) input.value = st.url;
+    // 轮询「页面内下载按钮」的状态，把进度写回页面按钮（后端把状态注入 window.__dlState）
+    pollPaneDlStates();
+  } catch {
+    /* ignore */
+  }
+}
+
+let paneDlTimer = 0;
+
+/** 面板页内下载按钮的进度回显：取状态 → 注入页面 → 按钮文字更新 */
+async function pollPaneDlStates() {
+  const now = Date.now();
+  if (now - paneDlTimer < 2500) return; // 2.5s 一次，别太密
+  paneDlTimer = now;
+  try {
+    const r = await api('/page/dl-requests');
+    if (!r.states?.length) return;
+    await api('/browser/eval', {
+      method: 'POST',
+      body: {
+        js: `(()=>{ window.__dlState = Object.assign(window.__dlState||{}, ${JSON.stringify(
+          Object.fromEntries(r.states.map((s) => [s.url, s]))
+        )});
+        document.querySelectorAll('[data-collector-dl]').forEach((b)=>{
+          const st = window.__dlState[b.getAttribute('data-collector-dl')];
+          if(!st) return;
+          if(st.status==='done') b.textContent='✓ 已下载';
+          else if(st.status==='error'){
+            // 按钮只放短标签，完整原因进 title（悬停可见）。
+            // 原来直接 note.slice(0,10) 会显示成 "✗ ERROR: [Do" 这种半截英文。
+            b.textContent='✗ 失败';
+            b.title=String(st.note||'下载失败');
+            b.dataset.busy='';
+          }
+          else if(st.status==='working') b.textContent='↓ 解析中';
+        });
+        return 1;})()`,
+      },
+    }).catch(() => {});
   } catch {
     /* ignore */
   }
@@ -277,11 +322,31 @@ $('#bw-mute').addEventListener('click', async () => {
   }
 });
 
+/* 内置浏览器：一键下载当前页视频（无水印） */
+$('#bw-dl-page').addEventListener('click', async () => {
+  const btn = $('#bw-dl-page');
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '解析中…';
+  try {
+    const r = await api('/page/download', { method: 'POST', body: {} });
+    toast(`已下载：${(r.title || '').slice(0, 30) || '本页视频'}（${fmtSize(r.size)}）→ 素材库`, 'ok');
+    btn.textContent = '✓ 已下载';
+  } catch (error) {
+    toast(error.message.includes('BUSY') ? '采集任务运行中，等任务结束再下' : error.message, 'err');
+    btn.textContent = old;
+  } finally {
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = old;
+    }, 2200);
+  }
+});
+
 $('#bw-login-check').addEventListener('click', async () => {
   await checkLogin();
   const strip = $('#bw-login-strip');
-  if (state.login?.platforms) {
-    strip.innerHTML = state.login.platforms
+  if (state.login?.platforms) {    strip.innerHTML = state.login.platforms
       .map((p) => `<span><i class="dot" style="background:${p.loggedIn ? 'var(--ok)' : 'var(--text-mute)'}"></i>${p.label} ${p.loggedIn ? '已登录' : '未登录'}</span>`)
       .join('');
   }
@@ -326,6 +391,17 @@ function renderBanner(health) {
     totalItems === 0
       ? '还没有素材，先去「采集」抓一些。'
       : `共 ${totalItems} 条素材，已下载 ${downloaded} 条，占用 ${fmtSize(s.total?.size || 0)}`;
+}
+
+/** 重新拉一次统计并刷素材库摘要（下载完成后调用，让数字实时更新） */
+async function refreshStats() {
+  try {
+    const health = await api('/health');
+    state.settings = health.settings || state.settings;
+    renderBanner(health);
+  } catch {
+    /* ignore */
+  }
 }
 
 function renderPlatformPicker() {
@@ -828,10 +904,22 @@ async function pollCaptchaAlert() {
     const r = await api('/captcha/alert');
     if (!r.alert) return;
     if (r.alert.at === captchaBannerShown) {
-      // 同一次告警：若已检测到验证通过，更新提示
-      if (r.alert.passed) {
+      // 同一次告警：若已检测到验证通过，自动继续（不用人点）
+      if (r.alert.passed && !r.alert.autoResumed) {
+        r.alert.autoResumed = true;
         const bar = document.querySelector('.restore-banner.captcha');
-        if (bar) bar.innerHTML = '✓ 验证已通过，请点任务的「我已登录，继续」';
+        if (bar) bar.innerHTML = '✓ 验证已通过，正在自动继续任务…';
+        api('/captcha/done', { method: 'POST', body: {} })
+          .then(() => {
+            bar?.remove();
+            captchaBannerShown = 0;
+            loadJobs();
+            toast('验证已通过，任务已自动继续', 'ok');
+          })
+          .catch(() => {
+            // 自动继续失败退回手动
+            if (bar) bar.innerHTML = '⚠ 自动继续失败，请点任务的「我已登录，继续」';
+          });
       }
       return;
     }
@@ -1218,35 +1306,194 @@ let dlTimer = null;
 
 function startDlPolling() {
   if (dlTimer) return;
+  // 没有活跃任务时不要立刻停：面板按钮发起的下载要过几秒才出现在库里，
+  // 这里保持轮询，连续 60 秒都没有活跃任务才真正停下。
+  // 进度只在「下载中心」里展示（侧栏徽标显示进行中数量），
+  // 结果页/素材库不再重复挂进度条。
+  let idleTicks = 0;
   dlTimer = setInterval(async () => {
     try {
       const data = await api('/downloads');
-      const active = data.downloads.filter((d) => d.status === 'downloading');
-      const strip = $('#dl-strip');
+      const active = data.downloads.filter((d) => d.status === 'downloading' || d.status === 'queued');
+      updateDlBadge(data.downloads);
       if (!active.length) {
-        strip.classList.add('hidden');
+        idleTicks += 1;
+        if (idleTicks < 50) {
+          // 还开着下载中心就继续刷列表（可能有刚完成的）
+          if ($('#view-downloads').classList.contains('active')) renderDlcRows(data.downloads);
+          return;
+        }
         clearInterval(dlTimer);
         dlTimer = null;
+        // 下载结束了：刷新统计数字，素材库/下载中心开着就一并刷
+        refreshStats();
+        if ($('#view-downloads').classList.contains('active')) loadDownloadCenter();
+        if ($('#view-library').classList.contains('active')) loadLibrary();
         return;
       }
-      strip.classList.remove('hidden');
-      const total = active.reduce((acc, d) => acc + (d.total || 0), 0);
-      const received = active.reduce((acc, d) => acc + (d.received || 0), 0);
-      const speed = active.reduce((acc, d) => acc + (d.speed || 0), 0);
-      const first = active[0];
-      if (total > 0) {
-        const pct = Math.min(100, Math.round((received / total) * 100));
-        $('#dl-fill').style.width = pct + '%';
-        $('#dl-info').textContent = `下载中 ${active.length} 个 · ${fmtSize(received)} / ${fmtSize(total)} · ${fmtSize(speed)}/s · ${first.title || ''}`;
-      } else {
-        $('#dl-fill').style.width = '30%';
-        $('#dl-info').textContent = `下载中 ${active.length} 个 · 已取 ${fmtSize(received)} · ${fmtSize(speed)}/s · ${first.title || ''}`;
-      }
+      idleTicks = 0;
+      // 同步 dlcState.rows，这样 loadDownloadCenter() 不会拉旧数据；
+      // 下载中心开着就实时刷新进度行
+      dlcState.rows = data.downloads;
+      if ($('#view-downloads').classList.contains('active')) renderDlcRows(data.downloads);
     } catch {
       /* ignore */
     }
   }, 1200);
 }
+
+/* ---------------- 下载中心 ---------------- */
+const dlcState = { filter: '', rows: [] };
+
+function updateDlBadge(downloads) {
+  const n = (downloads || []).filter((d) => d.status === 'downloading' || d.status === 'queued').length;
+  const badge = $('#nav-dl-count');
+  if (!badge) return;
+  badge.textContent = String(n);
+  badge.classList.toggle('hidden', n === 0);
+}
+
+async function loadDownloadCenter() {
+  try {
+    const data = await api('/downloads');
+    dlcState.rows = data.downloads || [];
+    updateDlBadge(dlcState.rows);
+    renderDlcRows(dlcState.rows);
+    const done = dlcState.rows.filter((d) => d.status === 'done').length;
+    const fail = dlcState.rows.filter((d) => d.status === 'error').length;
+    const act = dlcState.rows.filter((d) => d.status === 'downloading' || d.status === 'queued').length;
+    $('#dlc-summary').textContent = `进行中 ${act} · 失败 ${fail} · 已完成 ${done}`;
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+function renderDlcRows(rows) {
+  const list = $('#dlc-list');
+  if (!list) return;
+  const f = dlcState.filter;
+  const shown = f ? rows.filter((d) => d.status === f) : rows;
+  if (!shown.length) {
+    list.innerHTML = '<div class="empty">没有下载任务。去「结果」页勾选下载，或在「内置浏览器」里点视频卡片上的下载按钮。</div>';
+    return;
+  }
+  list.innerHTML = shown
+    .map((d) => {
+      const color = PLATFORM_COLORS[d.platform] || '#666';
+      const label = state.platforms.find((p) => p.id === d.platform)?.label || d.platform || '';
+      const total = d.total || 0;
+      const recv = d.received || 0;
+      const pct = total > 0 ? Math.min(100, Math.round((recv / total) * 100)) : 0;
+      let bar = '';
+      let status = '';
+      if (d.status === 'downloading') {
+        // 后端超过 3s 没收到新字节就把 speed 报成 0：这时明确显示「等待数据」，
+        // 否则进度条定在某个百分比又没速度，看着像卡死但分不清是慢还是坏了。
+        const idle = !(d.speed > 0);
+        bar = `<div class="dlc-bar"><div class="dlc-fill${idle ? ' idle' : ''}" style="width:${total > 0 ? pct : 30}%"></div></div>`;
+        // 还没拿到 content-length 时 total=0，这时显示「解析中」+ 已收字节，
+        // 别只显示一个空的速度占位，看着像没动
+        const head = total > 0 ? `${pct}%` : (recv > 0 ? '下载中' : '解析中');
+        const parts = [`<span class="dlc-tag run">${head}</span>`];
+        if (recv > 0) parts.push(`<span>${fmtSize(recv)}${total ? ' / ' + fmtSize(total) : ''}</span>`);
+        parts.push(d.speed > 0 ? `<span>${fmtSize(d.speed)}/s</span>` : `<span class="dlc-idle">等待数据…</span>`);
+        status = parts.join('');
+      } else if (d.status === 'queued') {
+        bar = `<div class="dlc-bar"><div class="dlc-fill" style="width:12%"></div></div>`;
+        status = `<span class="dlc-tag run">排队中</span>`;
+      } else if (d.status === 'done') {
+        status = `<span class="dlc-tag ok">完成</span><span>${fmtSize(d.received || d.total || 0)} · ${d.engine || ''}</span>`;
+      } else if (d.status === 'error') {
+        status = `<span class="dlc-tag err">失败</span><span class="dlc-err">${escapeHtml((d.error || '').slice(0, 90))}</span>`;
+      } else if (d.status === 'cancelled') {
+        status = `<span class="dlc-tag">已取消</span>`;
+      }
+      const actions =
+        d.status === 'done'
+          ? `<button class="btn small ghost" data-dlc-reveal="${d.id}">📁 打开</button>`
+          : d.status === 'error' || d.status === 'cancelled'
+            ? `<button class="btn small ghost" data-dlc-retry="${d.id}">↻ 重试</button><button class="btn small ghost" data-dlc-cancel="${d.id}">删记录</button>`
+            : d.status === 'downloading' || d.status === 'queued'
+              ? `<button class="btn small ghost" data-dlc-cancel="${d.id}">取消</button>`
+              : '';
+      return `<div class="dlc-row" data-id="${d.id}">
+        <div class="dlc-main">
+          <div class="dlc-title">
+            <span class="ci-plat" style="background:${color}">${label}</span>
+            <span>${escapeHtml(d.title || d.dest || '(未命名)')}</span>
+          </div>
+          ${bar}
+          <div class="dlc-meta">${status}<span class="dlc-time">${fmtTime(d.created_at)}</span></div>
+        </div>
+        <div class="dlc-actions">${actions}</div>
+      </div>`;
+    })
+    .join('');
+
+  for (const el of list.querySelectorAll('[data-dlc-reveal]')) {
+    el.addEventListener('click', async () => {
+      const row = dlcState.rows.find((x) => x.id === el.dataset.dlcReveal);
+      if (row?.dest) api('/reveal', { method: 'POST', body: { path: row.dest } }).catch((e) => toast(e.message, 'err'));
+    });
+  }
+  for (const el of list.querySelectorAll('[data-dlc-retry]')) {
+    el.addEventListener('click', async () => {
+      el.disabled = true;
+      el.textContent = '重试中…';
+      try {
+        await api('/download/retry', { method: 'POST', body: { ids: [el.dataset.dlcRetry] } });
+        toast('已重新排队下载', 'ok');
+        startDlPolling();
+        loadDownloadCenter();
+      } catch (error) {
+        toast(error.message, 'err');
+        el.disabled = false;
+        el.textContent = '↻ 重试';
+      }
+    });
+  }
+  for (const el of list.querySelectorAll('[data-dlc-cancel]')) {
+    el.addEventListener('click', async () => {
+      try {
+        await api('/download/cancel', { method: 'POST', body: { id: el.dataset.dlcCancel } });
+        loadDownloadCenter();
+      } catch (error) {
+        toast(error.message, 'err');
+      }
+    });
+  }
+}
+
+$('#dlc-filter').addEventListener('change', () => {
+  dlcState.filter = $('#dlc-filter').value;
+  renderDlcRows(dlcState.rows);
+});
+
+$('#btn-dlc-retry-all').addEventListener('click', async () => {
+  const failed = dlcState.rows.filter((d) => d.status === 'error' || d.status === 'cancelled');
+  if (!failed.length) {
+    toast('没有失败的任务', 'err');
+    return;
+  }
+  try {
+    await api('/download/retry', { method: 'POST', body: { ids: failed.map((d) => d.id) } });
+    toast(`已重试 ${failed.length} 个`, 'ok');
+    startDlPolling();
+    loadDownloadCenter();
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+});
+
+$('#btn-dlc-clear').addEventListener('click', async () => {
+  try {
+    const r = await api('/download/clear-done', { method: 'POST', body: { includeError: true } });
+    toast(`已清理 ${r.cleared} 条记录（含失败/中断）`, 'ok');
+    loadDownloadCenter();
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+});
 
 /* ---------------- 结果视图 ---------------- */
 let resultsLoaded = false;
@@ -1259,6 +1506,7 @@ async function loadResults() {
     platform: $('#filter-platform').value,
     keyword: $('#filter-keyword').value,
     status: $('#filter-status').value,
+    subtitle: $('#filter-subtitle').value,
     q: $('#search-q').value.trim(),
     sort: $('#sort-by').value,
     limit: state.pageSize,
@@ -1301,6 +1549,15 @@ function tileHtml(item, selectable, index = 99) {
   const label = state.platforms.find((p) => p.id === item.platform)?.label || item.platform;
   const selected = state.selected.has(item.id);
   const done = item.status === 'done';
+  // 字幕标注
+  const subMark =
+    item.subtitle === 'none'
+      ? '<span class="sub-mark ok">无字幕</span>'
+      : item.subtitle === 'hard'
+        ? '<span class="sub-mark warn">有字幕</span>'
+        : item.subtitle === 'unknown'
+          ? '<span class="sub-mark">检测失败</span>'
+          : '';
   return `<div class="tile${selected ? ' selected' : ''}" data-id="${item.id}">
     <div class="thumb">
       ${item.cover ? `<img loading="${index < 24 ? 'eager' : 'lazy'}" src="/api/proxy/image?url=${encodeURIComponent(item.cover)}" alt="" />` : ''}
@@ -1309,6 +1566,7 @@ function tileHtml(item, selectable, index = 99) {
       ${item.duration ? `<span class="dur">${fmtDur(item.duration)}</span>` : ''}
       ${selectable ? `<span class="check">${selected ? '✓' : ''}</span>` : ''}
       ${done ? `<span class="mark">✓</span>` : ''}
+      ${done ? '' : `<button class="tile-dl" data-dl="${item.id}" title="下载这一个">⬇ 下载</button>`}
     </div>
     <div class="info">
       <div class="title">${escapeHtml(item.title || '(无标题)')}</div>
@@ -1316,6 +1574,7 @@ function tileHtml(item, selectable, index = 99) {
         <span class="author">${escapeHtml(item.author || '—')}</span>
         ${item.likes ? `<span>♥ ${fmtNum(item.likes)}</span>` : ''}
         ${item.status === 'error' ? '<span style="color:var(--err)">失败</span>' : ''}
+        ${subMark}
       </div>
     </div>
   </div>`;
@@ -1370,6 +1629,28 @@ function bindTiles(grid, rows) {
       const check = tile.querySelector('.check');
       if (check) check.textContent = state.selected.has(id) ? '✓' : '';
       $('#selected-count').textContent = state.selected.size;
+    });
+
+    // 单条下载按钮（不用勾选，直接下这一个）
+    tile.querySelector('.tile-dl')?.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      const btn = event.currentTarget;
+      btn.disabled = true;
+      const old = btn.innerHTML;
+      btn.textContent = '排队中…';
+      try {
+        await api('/download', { method: 'POST', body: { ids: [id] } });
+        btn.textContent = '已加入下载';
+        startDlPolling();
+        setTimeout(() => {
+          btn.disabled = false;
+          btn.innerHTML = old;
+        }, 2500);
+      } catch (error) {
+        toast('下载失败：' + error.message, 'err');
+        btn.disabled = false;
+        btn.innerHTML = old;
+      }
     });
 
     tile.addEventListener('click', () => openPreview(item));
@@ -1445,6 +1726,56 @@ async function runDownload(ids, btn) {
   });
 }
 
+/* 字幕检测（抽帧判硬字幕） */
+let subtitleTaskId = '';
+let subtitleTimer = null;
+
+$('#btn-detect-subtitle').addEventListener('click', async () => {
+  const btn = $('#btn-detect-subtitle');
+  // 已选中就只测选中的；否则测本页所有未检测的
+  const ids = [...state.selected];
+  const body = ids.length ? { ids } : { scope: 'pending', limit: 30 };
+  btn.disabled = true;
+  btn.textContent = '检测中…';
+  try {
+    const r = await api('/subtitle/detect', { method: 'POST', body });
+    subtitleTaskId = r.taskId;
+    toast(`开始检测 ${r.total} 条（每条只拉 6MB 小样）`, 'ok');
+    if (subtitleTimer) clearInterval(subtitleTimer);
+    subtitleTimer = setInterval(async () => {
+      try {
+        const t = await api(`/subtitle/task?id=${subtitleTaskId}`);
+        btn.textContent = `检测 ${t.done}/${t.total}`;
+        if (t.status === 'done' || t.status === 'error') {
+          clearInterval(subtitleTimer);
+          subtitleTimer = null;
+          btn.disabled = false;
+          btn.textContent = '检测字幕';
+          toast(
+            `检测完成：无字幕 ${t.none}、有字幕 ${t.hard}、失败 ${t.failed}（小样共 ${(t.sampleBytes / 1048576).toFixed(1)}MB）`,
+            t.failed ? '' : 'ok'
+          );
+          loadResults();
+        }
+      } catch {
+        clearInterval(subtitleTimer);
+        subtitleTimer = null;
+        btn.disabled = false;
+        btn.textContent = '检测字幕';
+      }
+    }, 2500);
+  } catch (error) {
+    toast(error.message, 'err');
+    btn.disabled = false;
+    btn.textContent = '检测字幕';
+  }
+});
+
+$('#filter-subtitle').addEventListener('change', () => {
+  state.page = 0;
+  loadResults();
+});
+
 $('#btn-download-selected').addEventListener('click', async () => {
   const ids = [...state.selected];
   if (!ids.length) {
@@ -1497,13 +1828,15 @@ async function loadLibrary() {
       .map(
         (item, index) => `<div class="tile" data-id="${item.id}">
           <div class="thumb">
+            <span class="thumb-fallback" style="background:linear-gradient(135deg,${PLATFORM_COLORS[item.platform] || '#444'},#1b1f2a)"></span>
             ${item.local_path
-              ? `<img loading="${index < 24 ? 'eager' : 'lazy'}" src="/media/${encodeURIComponent(item.local_path.replace(/\.mp4$/i, '.jpg'))}" onerror="this.onerror=null;this.src='/api/proxy/image?url=${encodeURIComponent(item.cover)}'" alt="" />`
+              ? `<img loading="${index < 24 ? 'eager' : 'lazy'}" src="/media/${encodeURIComponent(item.local_path.replace(/\.mp4$/i, '.jpg'))}" onerror="this.style.display='none'${item.cover ? `;this.src='/api/proxy/image?url=${encodeURIComponent(item.cover)}'` : ''}" alt="" />`
               : item.cover
-                ? `<img loading="lazy" src="/api/proxy/image?url=${encodeURIComponent(item.cover)}" alt="" />`
+                ? `<img loading="lazy" src="/api/proxy/image?url=${encodeURIComponent(item.cover)}" onerror="this.style.display='none'" alt="" />`
                 : ''}
             <span class="plat" style="background:${PLATFORM_COLORS[item.platform] || '#666'}">${state.platforms.find((p) => p.id === item.platform)?.label || item.platform}</span>
             ${item.duration ? `<span class="dur">${fmtDur(item.duration)}</span>` : ''}
+            ${item.local_path ? `<button class="tile-dl" data-reveal="${item.id}" title="打开所在文件夹">📁 所在文件夹</button>` : ''}
           </div>
           <div class="info">
             <div class="title">${escapeHtml(item.title)}</div>
@@ -1518,6 +1851,14 @@ async function loadLibrary() {
 
     const map = new Map(data.rows.map((r) => [r.id, r]));
     for (const tile of grid.querySelectorAll('.tile')) {
+      // 悬停按钮：打开文件所在文件夹
+      tile.querySelector('[data-reveal]')?.addEventListener('click', (event) => {
+        event.stopPropagation();
+        const item = map.get(tile.dataset.id);
+        if (item?.local_path) {
+          api('/reveal', { method: 'POST', body: { path: item.local_path } }).catch((e) => toast(e.message, 'err'));
+        }
+      });
       tile.addEventListener('click', () => openPreview(map.get(tile.dataset.id), true));
     }
   } catch (error) {

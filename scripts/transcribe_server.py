@@ -100,6 +100,15 @@ def load_model(name: str):
     return _model_cache[name]
 
 
+def _t2s_converter():
+    """繁→简转换器；opencc 没装时返回 None（跳过转换）"""
+    try:
+        from opencc import OpenCC
+        return OpenCC("t2s")
+    except Exception:
+        return None
+
+
 def transcribe_one(path: str, language: str = "", model: str = "", vad: bool = True):
     """转写单个音视频文件，返回文本 + 分段（带时间轴）"""
     if not os.path.isfile(path):
@@ -107,6 +116,10 @@ def transcribe_one(path: str, language: str = "", model: str = "", vad: bool = T
     t0 = time.time()
     try:
         m, device, compute = load_model(model or DEFAULT_MODEL)
+        # 中文任务用简体示例引导（whisper 训练语料繁体多，默认常输出繁体）
+        prompt = ""
+        if language == "zh" or (not language):
+            prompt = "以下是普通话的句子，使用简体中文书写。"
         segments, info = m.transcribe(
             path,
             language=(language or None),
@@ -114,13 +127,17 @@ def transcribe_one(path: str, language: str = "", model: str = "", vad: bool = T
             vad_parameters={"min_silence_duration_ms": 500},
             beam_size=5,
             word_timestamps=False,
+            initial_prompt=prompt or None,
         )
+        cc = _t2s_converter()  # 兜底：无论模型输出什么，繁体一律转简体
         segs = []
         parts = []
         for s in segments:
             text = (s.text or "").strip()
             if not text:
                 continue
+            if cc is not None:
+                text = cc.convert(text)
             segs.append({"start": round(s.start, 2), "end": round(s.end, 2), "text": text})
             parts.append(text)
         full = "".join(parts)

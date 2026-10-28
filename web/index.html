@@ -24,6 +24,10 @@
         <span class="ico">▦</span> 结果
         <em id="nav-result-count" class="badge hidden">0</em>
       </button>
+      <button class="nav-item" data-view="downloads">
+        <span class="ico">⇣</span> 下载中心
+        <em id="nav-dl-count" class="badge hidden">0</em>
+      </button>
       <button class="nav-item" data-view="library">
         <span class="ico">▤</span> 素材库
       </button>
@@ -101,11 +105,6 @@
         <p>采集到的素材，勾选后下载到素材库。</p>
       </header>
 
-      <div class="dl-strip hidden" id="dl-strip">
-        <div class="dl-info" id="dl-info">下载中…</div>
-        <div class="dl-bar"><div class="dl-fill" id="dl-fill"></div></div>
-      </div>
-
       <div class="toolbar">
         <select id="filter-platform">
           <option value="">全部平台</option>
@@ -124,14 +123,44 @@
           <option value="likes">点赞最多</option>
           <option value="duration">时长最长</option>
         </select>
+        <select id="filter-subtitle">
+          <option value="">字幕：全部</option>
+          <option value="none">无字幕</option>
+          <option value="hard">有字幕</option>
+          <option value="unknown">未检测</option>
+        </select>
         <input type="search" id="search-q" placeholder="搜标题 / 文案 / 作者" />
         <div class="spacer"></div>
+        <button class="btn ghost small" id="btn-detect-subtitle">检测字幕</button>
         <button class="btn ghost small" id="btn-select-all">全选本页</button>
         <button class="btn ghost small" id="btn-download-selected">下载选中 (<span id="selected-count">0</span>)</button>
       </div>
 
       <div class="grid" id="result-grid"></div>
       <div class="pager" id="result-pager"></div>
+    </section>
+
+    <!-- 下载中心 -->
+    <section class="view" id="view-downloads">
+      <header class="view-head">
+        <h1>下载中心</h1>
+        <p id="dlc-summary">所有下载任务：进行中 / 失败 / 已完成。</p>
+      </header>
+
+      <div class="toolbar">
+        <select id="dlc-filter">
+          <option value="">全部</option>
+          <option value="downloading">进行中</option>
+          <option value="queued">排队中</option>
+          <option value="error">失败</option>
+          <option value="done">已完成</option>
+        </select>
+        <div class="spacer"></div>
+        <button class="btn ghost small" id="btn-dlc-clear">清理已完成记录</button>
+        <button class="btn ghost small" id="btn-dlc-retry-all">重试全部失败</button>
+      </div>
+
+      <div id="dlc-list" class="dlc-list"></div>
     </section>
 
     <!-- 素材库 -->
@@ -319,6 +348,7 @@
         <div class="quick-platforms" id="bw-quick"></div>
         <input type="text" id="bw-url" class="bw-url" placeholder="输入网址或选上面的平台" spellcheck="false" />
         <button class="btn small" id="bw-go">打开</button>
+        <button class="btn small" id="bw-dl-page" title="把当前页面正在看的视频按无水印下载到素材库">⬇ 下载本页视频</button>
         <button class="btn ghost small" id="bw-login-check">检测登录</button>
         <button class="btn small hidden" id="bw-task-view">看任务画面</button>
         <button class="btn ghost small" id="bw-mute" title="内置浏览器声音">🔇 静音中</button>
