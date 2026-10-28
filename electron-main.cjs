@@ -29,10 +29,30 @@ function logCrash(tag, detail) {
     /* ignore */
   }
 }
+// 强杀/正常退出时，Electron 也会给每个子进程报 child-process-gone(crashed, exitCode -1)。
+// 这些记录和真崩溃长得一模一样，害得排查时以为 NetworkService/AudioService 一直在崩。
+// 用一个标记把「我们自己在退出」和「真崩」分开。
+let quitting = false;
+app.on('before-quit', () => {
+  quitting = true;
+});
 process.on('uncaughtException', (err) => logCrash('uncaughtException', err.stack || err.message));
 process.on('unhandledRejection', (err) => logCrash('unhandledRejection', (err && (err.stack || err.message)) || String(err)));
-app.on('child-process-gone', (_e, details) => logCrash('child-process-gone', JSON.stringify(details)));
-app.on('render-process-gone', (_e, _wc, details) => logCrash('render-process-gone', JSON.stringify(details)));
+app.on('child-process-gone', (_e, details) => {
+  if (quitting) return;
+  logCrash('child-process-gone', JSON.stringify(details));
+});
+// 记下是哪个页面挂的（主窗口 or 内置浏览器的 WebContentsView），否则只知道「有个渲染进程崩了」
+app.on('render-process-gone', (_e, wc, details) => {
+  if (quitting) return;
+  let where = '';
+  try {
+    where = ` url=${wc?.getURL?.() || '?'} type=${wc?.getType?.() || '?'}`;
+  } catch {
+    /* webContents 可能已销毁 */
+  }
+  logCrash('render-process-gone', JSON.stringify(details) + where);
+});
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -50,14 +70,18 @@ if (!gotLock) {
 
 async function bootstrap() {
   console.log('[boot] step1 menu');
-  // 启动先检查有没有待恢复的登录态备份（上次退出前请求的）
+  // 启动先把已有登录态备份读进守护内存，这样「一键恢复」从一开始就可用
   try {
     const guard = await import('./lib/login-guard.mjs');
-    const g = guard.createLoginGuard({ rootDir: ROOT });
-    const r = g.applyPendingRestore();
-    if (r.restored) console.log('[boot] 已从备份恢复登录态:', (r.platforms && Object.keys(r.platforms).filter(k => r.platforms[k]).join(', ')) || '');
+    const g = guard.createLoginGuard({ getSession: () => null });
+    const f = path.join(ROOT, 'data', 'login-backup', 'latest.json');
+    if (fs.existsSync(f)) {
+      const meta = JSON.parse(fs.readFileSync(f, 'utf8'));
+      g.prefillMeta(meta);
+      if (meta?.count) console.log('[boot] 已载入登录态备份:', meta.count, '条 cookie（', meta.at, '）');
+    }
   } catch (e) {
-    console.warn('[boot] 登录态恢复检查失败:', e.message);
+    console.warn('[boot] 登录态备份载入失败:', e.message);
   }
   Menu.setApplicationMenu(null);
 
