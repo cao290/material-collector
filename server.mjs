@@ -21,6 +21,7 @@ import * as dbCopies from './lib/db-copies.mjs';
 import { mountCopyApi } from './lib/copy-api.mjs';
 // 视频转写：数据层/服务客户端/取音频/批量任务/HTTP API 全在这一个模块里
 import { ensureTranscribeSchema, mountTranscribe } from './lib/transcribe.mjs';
+import { mountSubtitleApi } from './lib/subtitle-api.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE_PORT = Number(process.env.PORT) || 8343;
@@ -36,15 +37,37 @@ const now = () => Date.now();
 const loginGuard = createLoginGuard({
   getSession: () => browserHost?.getSession?.() || null,
 });
+// 启动时把磁盘上的登录态备份读进守护内存，否则重启后 hasBackup()/丢失提示要等
+// 第一次成功备份（可能已经登不上）才可用——「一键恢复」就永远用不上。
+try {
+  const backupFile = path.join(__dirname, 'data', 'login-backup', 'latest.json');
+  if (fs.existsSync(backupFile)) {
+    const meta = JSON.parse(fs.readFileSync(backupFile, 'utf8'));
+    if (meta?.cookies?.length) loginGuard.prefillMeta(meta);
+  }
+} catch {
+  /* 备份文件损坏就当没有 */
+}
 dbCopies.migrateCopySchema(db);
 ensureTranscribeSchema(db);
+
+// 启动清账：上次退出时残留的 downloading/queued 记录已无进程在跑，标成中断，
+// 否则它们在下载中心永远显示「进行中」且进度卡住。
+try {
+  const stale = db
+    .prepare("UPDATE downloads SET status = 'error', error = '进程重启，任务中断' WHERE status IN ('downloading','queued')")
+    .run();
+  if (stale.changes) console.log(`[boot] 清理 ${stale.changes} 条中断的下载记录`);
+} catch {
+  /* ignore */
+}
 
 /** 设置持久化 */
 const SETTINGS_FILE = path.join(__dirname, 'data', 'settings.json');
 const DEFAULT_SETTINGS = {
   downloadDir: 'H:\\素材库',
   rootDir: 'H:\\素材库',
-  concurrency: 3,
+  concurrency: 5,
   delayMin: 800,
   delayMax: 1800,
   defaultTarget: 50,
@@ -66,6 +89,50 @@ function saveSettings() {
   fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
 }
+
+// 启动清扫下载残片：进程被强杀时 finally 不会跑，`.part`/`.m4s`/`.tmp` 半成品会留在
+// 素材库里永久占盘（实测攒过 332MB）。这些文件永远不该长期存在（成功会被 rename 掉），
+// 所以开机递归扫一遍素材库删干净。只删明确的临时后缀，不碰正式成品。
+// 必须放在 settings 加载之后调用——依赖 settings.downloadDir。
+function sweepTempFiles() {
+  try {
+    const dir = settings.downloadDir;
+    let freed = 0;
+    let n = 0;
+    const isTmp = (name) =>
+      /\.part$/.test(name) ||
+      /\.part\.m4a$/.test(name) ||
+      /\.tmp\.mp4$/.test(name) ||
+      /\.(v|a)\.m4s$/.test(name) ||
+      /\.tmp\.(douyin|xhs|kuaishou|bilibili)$/.test(name);
+    const walk = (d) => {
+      let entries;
+      try {
+        entries = fs.readdirSync(d, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (isTmp(e.name)) {
+          try {
+            freed += fs.statSync(p).size;
+            fs.unlinkSync(p);
+            n += 1;
+          } catch {
+            /* 单个文件删不掉（占用/权限）不影响其他文件 */
+          }
+        }
+      }
+    };
+    if (dir && fs.existsSync(dir)) walk(dir);
+    if (n) console.log(`[boot] 清扫 ${n} 个下载残片，释放 ${(freed / 1048576).toFixed(1)}MB`);
+  } catch {
+    /* 清理失败不能拖垮启动 */
+  }
+}
+sweepTempFiles();
 
 /** 浏览器宿主（Electron 主进程注入；直接 node 启动时为 null） */
 let browserHost = null;
@@ -105,6 +172,7 @@ setInterval(() => {
 const runningCopy = new Map(); // 文案采集任务
 const copyRoutes = new Map(); // 文案·评论·AI 路由表
 const transcribeRoutes = new Map(); // 转写路由表
+const subtitleRoutes = new Map();   // 字幕检测路由表
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
@@ -156,14 +224,53 @@ function pushWebhook(event, payload) {
   });
 }
 
-/** 下载进度写库 */
+/** 下载进度写库
+ *  回调本身已节流到 120ms，但写 SQLite 是同步 IO，
+ *  大文件时每次都写会明显拖慢下载，这里再按 500ms 落一次。 */
+const _lastDlWrite = new Map();
 function onProgressUpdate(db, dlId, p, phase) {
-  updateDownload(db, dlId, {
-    status: 'downloading',
-    received: p.received || 0,
-    total: p.total || 0,
-    speed: p.speed || 0,
-  });
+  const now = Date.now();
+  const last = _lastDlWrite.get(dlId) || 0;
+  if (now - last < 500) return;
+  _lastDlWrite.set(dlId, now);
+  // 只在记录仍是进行中时才写。取消/失败收尾后，下载器可能还有一次迟到的进度回调，
+  // 无条件 UPDATE 会把 cancelled 又改回 downloading，下载中心就永远停在那一条上。
+  db.prepare(
+    `UPDATE downloads SET status = 'downloading', received = ?, total = ?, speed = ?, updated_at = ?
+     WHERE id = ? AND status IN ('downloading','queued')`
+  ).run(p.received || 0, p.total || 0, p.speed || 0, now, dlId);
+}
+
+/** 把底层技术错误翻译成人话（下载中心里显示给用户看） */
+function humanizeDownloadError(msg) {
+  const m = String(msg || '').trim();
+  if (!m) return '未知错误';
+  if (/已取消/.test(m)) return '已取消';
+  // fetch 被 abort 时抛的是 DOMException，文案是英文且各 Node 版本不一样，
+  // 不翻译的话下载中心会直接显示「This operation was aborted」。
+  if (/AbortError|This operation was aborted|The operation was aborted|aborted/i.test(m)) {
+    return '请求被中止（取消或超时）';
+  }
+  if (/\(-101\)|ERR_ABORTED|ERR_FAILED/i.test(m) && /bilibili\.com\/video|douyin\.com|xiaohongshu|kuaishou/i.test(m)) {
+    return '视频页打不开（可能已被删除或下架）';
+  }
+  if (/\(-101\)/i.test(m)) return '页面加载失败（网络中断或链接失效）';
+  if (/\(-3\)|ERR_ABORTED/i.test(m)) return '请求被中止';
+  if (/\(-105\)|ERR_NAME_NOT_RESOLVED/i.test(m)) return '域名解析失败（检查网络）';
+  if (/\(-118\)|ERR_CONNECTION_TIMED_OUT|timeout|超时/i.test(m)) return '连接超时（网络不稳或平台限流）';
+  if (/数据停滞|连接停滞/.test(m)) return '连接停滞（CDN 中断传数据），已自动换源重试仍失败';
+  if (/只收到|字节不符/.test(m)) return '分段下载不完整（网络不稳，重试即可）';
+  if (/HTTP 403|deadline|过期/.test(m)) return '直链已过期（重试会重新取）';
+  if (/HTTP 567/.test(m)) return '被 CDN 拒绝（缺请求头，重试一次常可）';
+  if (/HTTP 404/.test(m)) return '资源不存在（视频可能已删除）';
+  if (/流为空|只下到/.test(m)) return '下载中断（网络不稳，重试即可）';
+  if (/Fresh cookies|需要登录|not necessary/.test(m)) return '登录态失效，去「内置浏览器」重新登录';
+  // 抖音详情页被风控时页面只剩「视频数据加载中」，别误导成登录问题
+  if (/验证码|安全验证|verifycenter|captcha/i.test(m)) return '触发平台验证码，去「内置浏览器」过一次验证';
+  if (/core_dep|filter_reason/.test(m)) return '这条视频平台不给公开数据（受限/仅粉丝可见），换一条试试';
+  if (/ffmpeg/i.test(m)) return '缺少 ffmpeg（合并音视频用）';
+  // 兜底：截断但保留可读部分
+  return m.length > 120 ? m.slice(0, 120) + '…' : m;
 }
 
 async function browserCookies() {
@@ -239,6 +346,8 @@ async function startJob({ platform, keyword, target, resumeJobId }) {
         keyword,
         target,
         signal: controller.signal,
+        // 恢复的任务（过完验证码/登录墙后继续的）自动进入谨慎模式，全部节奏放慢
+        cautious: !!resumeJobId,
         createSession: () => browserHost.createCollectSession(),
         checkLogin: () => browserHost.getLoginStatus(),
         onCaptcha: async ({ reason, url }) => {
@@ -319,37 +428,390 @@ async function fetchDetailForItem(item, signal) {
 
   // 内核被采集任务/自动化会话占用时静默降级（后续走 yt-dlp 兜底）
   if (browserHost.isBusy?.()) return null;
-  let base;
-  try {
-    base = await browserHost.createCollectSession();
-  } catch (error) {
-    if (error.code === 'BUSY') return null;
-    throw error;
-  }
-  let tab = base;
-  let ok = false;
-  try {
-    if (adapter.detail) {
-      const detail = await adapter.detail(tab, { ...item, page_url: item.page_url || '' });
+
+  // 硬超时：页面 evaluate 的 CDP 路径超时后会回退到 executeJavaScript（无超时），
+  // 页面 JS 一挂整个下载就跟着永远等。90s 内拿不到就放弃，回退存量直链/yt-dlp。
+  const DETAIL_TIMEOUT_MS = 90000;
+  let base = null;
+  // 超时后必须能真正掐断 work：否则它继续跑、继续占着内核和标签页，
+  // 下一个下载 createCollectSession 拿不到内核 → 整条队列卡死（实测卡过 372s）。
+  const ctl = new AbortController();
+  const ownSignal = signal ? AbortSignal.any([signal, ctl.signal]) : ctl.signal;
+  // 超时后 work 若「后来成功」，返回的 tab/base 没人接手 → 在这里兜底销毁
+  let abandoned = false;
+
+  const work = (async () => {
+    try {
+      base = await browserHost.createCollectSession();
+    } catch (error) {
+      if (error.code === 'BUSY') return null;
+      throw error;
+    }
+    // 会话建好时可能已经超时了，直接交还，别继续占用内核
+    if (abandoned) {
+      await base.closeTab?.().catch(() => {});
+      await base.destroy?.().catch(() => {});
+      return null;
+    }
+    let tab = base;
+    let ok = false;
+    try {
+      if (adapter.detail) {
+        const detail = await adapter.detail(tab, { ...item, page_url: item.page_url || '' });
+        if (detail?.video_url) {
+          ok = true;
+          if (abandoned) {
+            // 超时之后才拿到结果：调用方早已放弃，销毁资源别泄漏
+            await tab.closeTab().catch(() => {});
+            await base.destroy?.().catch(() => {});
+            return null;
+          }
+          return { detail, tab, base };
+        }
+        return null;
+      }
+      const { collectOne } = await import('./lib/detail.mjs');
+      const detail = await collectOne({ tab, adapter, item, signal: ownSignal });
       if (detail?.video_url) {
         ok = true;
+        if (abandoned) {
+          await tab.closeTab().catch(() => {});
+          await base.destroy?.().catch(() => {});
+          return null;
+        }
         return { detail, tab, base };
       }
       return null;
+    } finally {
+      if (!ok) {
+        await tab.closeTab().catch(() => {});
+        await base.destroy?.().catch(() => {});
+      }
     }
-    const { collectOne } = await import('./lib/detail.mjs');
-    const detail = await collectOne({ tab, adapter, item, signal });
-    if (detail?.video_url) {
-      ok = true;
-      return { detail, tab, base };
-    }
+  })();
+  // work 自己失败（不是超时）时别变成 unhandledRejection
+  work.catch(() => {});
+
+  let timerId = null;
+  const timer = new Promise((resolve) => {
+    timerId = setTimeout(() => resolve('TIMEOUT'), DETAIL_TIMEOUT_MS);
+    timerId.unref?.();
+  });
+  const result = await Promise.race([work, timer]);
+  clearTimeout(timerId);
+  if (result === 'TIMEOUT') {
+    abandoned = true;
+    ctl.abort(); // 掐断在途的 evaluate/navigate，让 work 尽快退出来
+    // 不 await work：它可能正卡在无超时的 executeJavaScript 里，await 会再卡 90s。
+    // abandoned 标记 + 上面的销毁分支保证它脱身后自己清理。
+    console.warn(`[detail] ${item.platform} ${item.platform_id} 现取直链超时 ${DETAIL_TIMEOUT_MS / 1000}s，回退存量直链`);
     return null;
-  } finally {
-    if (!ok) {
-      await tab.closeTab().catch(() => {});
-      await base.destroy?.().catch(() => {});
-    }
   }
+  return result;
+}
+
+/** 面板页发起的下载任务状态表（url → {status, percent, note}），注入按钮轮询显示进度 */
+const paneDlRunning = new Map();
+
+/**
+ * 对「面板里某个视频详情页 URL」执行无水印下载（手动下载链路的核心）。
+ * 内核忙时等上一小会再试（注入按钮的下载不该直接失败）。
+ * @returns {{code, body}}
+ */
+async function downloadFromPaneUrl(pageUrl) {
+  const platform = Object.keys(PLATFORM_META).find((k) => {
+    const m = PLATFORM_META[k];
+    try {
+      return pageUrl.includes(new URL(m.homeUrl).hostname.replace('www.', ''));
+    } catch {
+      return false;
+    }
+  });
+  if (!platform) return { code: 400, body: { error: '识别不了页面所属平台：' + (pageUrl.slice(0, 60) || '面板未打开页面') } };
+  const detailish = /\/(video|explore|discovery\/item|short-video|note)\//.test(pageUrl);
+  if (!detailish && platform !== 'bilibili') {
+    return { code: 400, body: { error: '这不是视频详情页（像是首页/搜索页），进到某个视频再下' } };
+  }
+
+  // 内核忙（采集/下载补详情）→ 最多等 60 秒
+  for (let i = 0; i < 30 && browserHost.isBusy?.(); i += 1) {
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (browserHost.isBusy?.()) return { code: 409, body: { error: 'BUSY', message: '采集任务运行中，稍后再试' } };
+
+  let session = null;
+  let dlRecId = null;
+  try {
+    const adapter = getAdapter(platform);
+    const itemId = `${platform}_page_${Date.now().toString(36)}`;
+    // platform_id 必须是真实作品号：详情接口要用它拼 aweme_id。
+    // 面板下载场景拿到的是详情页 URL，从这里抽真 id（抽不到才退回占位符）。
+    const realPlatformId =
+      (pageUrl.match(/\/(?:video|note|explore|discovery\/item|short-video)\/([A-Za-z0-9]+)/) || [])[1] ||
+      itemId;
+    const item = {
+      id: itemId,
+      platform,
+      platform_id: realPlatformId,
+      keyword: '手动下载',
+      title: '',
+      desc: '',
+      author: '',
+      likes: 0,
+      duration: 0,
+      page_url: pageUrl,
+      video_url: '',
+      audio_url: '',
+    };
+
+    // 快路径：面板页已经在某个页面上，直接在页面上下文里调详情接口。
+    // 实测只要 0.5s，而新建 CDP 会话 + 导航要十几秒——绝大多数情况走这里就够。
+    let detail = null;
+    if (platform === 'douyin' && realPlatformId && /^\d{15,25}$/.test(realPlatformId)) {
+      const apiUrl =
+        'https://www.douyin.com/aweme/v1/web/aweme/detail/' +
+        `?device_platform=webapp&aid=6383&channel=channel_pc_web&aweme_id=${realPlatformId}` +
+        '&request_source=600&origin_source=600&update_version_code=170400' +
+        '&pc_client_type=1&version_code=290100&version_name=29.1.0' +
+        '&cookie_enabled=true&platform=PC&pc_libra_divert=Windows';
+      const raw = await browserHost
+        .paneEval(
+          `(async () => {
+            try {
+              const r = await fetch(${JSON.stringify(apiUrl)}, { credentials: 'include', headers: { accept: 'application/json' } });
+              const t = await r.text();
+              return t.length > 80 ? t : '';
+            } catch (e) { return ''; }
+          })()`
+        )
+        .catch(() => '');
+      if (raw) {
+        const parsed = adapter.parseBody(String(raw), '手动下载');
+        if (parsed.length && parsed[0].video_url) detail = parsed[0];
+      }
+    }
+
+    // 慢路径：快路径没拿到（非抖音 / 接口被拦 / 页面不在抖音域）才建会话
+    if (!detail?.video_url) {
+      session = await browserHost.createPaneSession();
+      if (adapter?.detail) {
+        detail = await adapter.detail(session, item).catch(() => null);
+      }
+      if (!detail?.video_url) {
+        const { collectOne } = await import('./lib/detail.mjs');
+        detail = await collectOne({ tab: session, adapter, item, signal: null }).catch(() => null);
+      }
+    }
+    if (!detail?.video_url) {
+      return { code: 502, body: { error: '没能从页面拿到视频直链（页面可能还没加载完，或平台接口变了）' } };
+    }
+
+    const finalItem = {
+      ...item,
+      title: detail.title || item.title || '手动下载',
+      desc: detail.desc || '',
+      author: detail.author || '',
+      likes: detail.likes || 0,
+      duration: detail.duration || 0,
+      video_url: detail.video_url,
+      video_backups: detail.video_backups || [],
+      audio_url: detail.audio_url || '',
+      audio_backups: detail.audio_backups || [],
+    };
+
+    const saved = upsertItem(db, finalItem);
+    const realId = saved?.id || itemId;
+
+    const cookies = await browserCookies();
+    // 已经下好过就直接返回，不再建新记录——连点按钮会攒出一串重复的下载行
+    const prevDone = db
+      .prepare("SELECT id, dest, received FROM downloads WHERE item_id = ? AND status = 'done' ORDER BY rowid DESC LIMIT 1")
+      .get(realId);
+    if (prevDone?.dest && fs.existsSync(prevDone.dest)) {
+      return {
+        code: 200,
+        body: {
+          ok: true,
+          id: realId,
+          title: finalItem.title,
+          platform,
+          path: prevDone.dest,
+          size: prevDone.received || 0,
+          engine: 'cache',
+        },
+      };
+    }
+    // 先建记录并置成 downloading，边下边写进度——否则下载中心整段时间都是空白，
+    // 用户看不到速度和百分比，像是没启动。
+    // createDownload 返回的就是 id 字符串（不是对象），别写成 dlRec.id
+    dlRecId = createDownload(db, { itemId: realId, url: finalItem.video_url, engine: 'auto' });
+    updateDownload(db, dlRecId, { status: 'downloading', engine: 'direct' });
+    const result = await downloadItem({
+      item: finalItem,
+      outDir: settings.downloadDir,
+      cookies,
+      signal: AbortSignal.timeout(10 * 60 * 1000),
+      onProgress: (p) => {
+        updateDownload(db, dlRecId, {
+          received: p.received || 0,
+          total: p.total || 0,
+          speed: p.speed || 0,
+        });
+      },
+    });
+    updateItem(db, realId, { status: 'done', local_path: result.path, local_size: result.size, error: '' });
+    // 下载已经在这里同步做完了，记录必须直接落成 done。
+    // 原来 createDownload 建出来是 queued 且没人接管 → 下载中心永远挂着一条「排队中」。
+    updateDownload(db, dlRecId, {
+      status: 'done',
+      dest: result.path,
+      received: result.size,
+      total: result.size,
+      engine: result.engine || 'auto',
+    });
+    return {
+      code: 200,
+      body: {
+        ok: true,
+        id: realId,
+        title: finalItem.title,
+        platform,
+        path: result.path,
+        size: result.size,
+        engine: result.engine,
+      },
+    };
+  } catch (error) {
+    // 失败也要把这条下载记录收尾，否则会一直显示「下载中」
+    if (dlRecId) {
+      updateDownload(db, dlRecId, { status: 'error', error: humanizeDownloadError(error.message) });
+    }
+    return { code: 500, body: { error: error.message } };
+  } finally {
+    if (session) await session.closeTab().catch(() => {});
+  }
+}
+
+/**
+ * 启动一批素材下载（后台任务，多个并发 worker）。
+ * /api/download 与「下载重试」共用这条链路。
+ * @returns {{taskId, total}}
+ */
+async function startItemDownload(ids) {
+  const cookies = await browserCookies();
+  const queue = [...ids];
+  const results = [];
+  // 下载是 IO 等待型，并发拉高能显著提速；上限放到 10 防止把 CDN 惹毛
+  const workers = Math.max(1, Math.min(settings.concurrency || 5, 10));
+  const taskId = `dq-${Date.now().toString(36)}`;
+  const task = { id: taskId, total: ids.length, done: 0, ok: 0, failed: 0, cancelled: 0, status: 'running', results, startedAt: Date.now() };
+  downloadTasks.set(taskId, task);
+
+  const runOne = async () => {
+    while (queue.length) {
+      const id = queue.shift();
+      let item = getItem(db, id);
+      if (!item) continue;
+      const dlId = createDownload(db, { itemId: id, url: item.video_url || item.page_url, engine: 'auto' });
+      const controller = new AbortController();
+      downloads.set(dlId, { controller });
+      let detailCtx = null;
+
+      try {
+        // 直链带 deadline 会过期（抖音几小时就 403），凡有页面地址就现取新鲜直链。
+        // 之前只有 video_url 为空才取，结果存量链接过期后「重试」永远拿旧 403 链接，
+        // 错误文案写着「重试会重新取」实际却不取——就是在这里补上的。
+        if (item.page_url) {
+          updateDownload(db, dlId, { status: 'downloading', engine: 'detail' });
+          detailCtx = await fetchDetailForItem(item, controller.signal);
+          if (detailCtx?.detail) {
+            const fresh = detailCtx.detail;
+            updateItem(db, id, {
+              video_url: fresh.video_url || '',
+              audio_url: fresh.audio_url || '',
+              author: fresh.author || item.author,
+              likes: fresh.likes || item.likes,
+              duration: fresh.duration || item.duration,
+              desc: fresh.desc || item.desc,
+              extra: fresh.extra || item.extra,
+            });
+            item = getItem(db, id);
+          }
+        }
+        // 候选链不落库：凡有详情上下文，用新鲜直链+备用源覆盖本次下载
+        if (detailCtx?.detail) {
+          const fresh = detailCtx.detail;
+          item = {
+            ...item,
+            video_url: fresh.video_url || item.video_url,
+            video_backups: fresh.video_backups || [],
+            audio_url: fresh.audio_url || item.audio_url,
+            audio_backups: fresh.audio_backups || [],
+          };
+        }
+
+        const inPageFetch = detailCtx?.tab
+          ? async (url, phase) => {
+              const buf = await detailCtx.tab.fetchBinaryInPage(url, {
+                onProgress: (p) => onProgressUpdate(db, dlId, p, phase),
+              });
+              return buf;
+            }
+          : null;
+
+        const result = await downloadItem({
+          item,
+          outDir: settings.downloadDir,
+          cookies,
+          signal: controller.signal,
+          inPageFetch,
+          onProgress: (p) => onProgressUpdate(db, dlId, p, p.phase),
+        });
+        updateDownload(db, dlId, { status: 'done', dest: result.path, received: result.size, total: result.size, engine: result.engine });
+        updateItem(db, id, { status: 'done', local_path: result.path, local_size: result.size, error: '' });
+        results.push({ id, ok: true, path: result.path, engine: result.engine });
+        task.ok += 1;
+        task.done += 1;
+      } catch (error) {
+        // 用户点了取消 → controller 已 abort，abort 会让下载抛错。
+        // 这里不能一律记成 error，否则 cancel 路由刚写下的 cancelled 立刻被覆盖，
+        // 下载中心显示「失败」而不是「已取消」。
+        if (controller.signal.aborted) {
+          updateDownload(db, dlId, { status: 'cancelled', error: '已取消' });
+          updateItem(db, id, { status: 'cancelled', error: '已取消' });
+          results.push({ id, ok: false, cancelled: true, error: '已取消' });
+          task.cancelled = (task.cancelled || 0) + 1;
+          task.done += 1;
+        } else {
+          const friendly = humanizeDownloadError(error.message);
+          updateDownload(db, dlId, { status: 'error', error: friendly });
+          updateItem(db, id, { status: 'error', error: friendly });
+          results.push({ id, ok: false, error: friendly });
+          task.failed += 1;
+          task.done += 1;
+        }
+      } finally {
+        if (detailCtx) {
+          await detailCtx.tab.closeTab().catch(() => {});
+          await detailCtx.base.destroy?.().catch(() => {});
+        }
+        downloads.delete(dlId);
+      }
+    }
+  };
+
+  Promise.all(Array.from({ length: workers }, runOne))
+    .then(() => {
+      task.status = 'done';
+      task.finishedAt = Date.now();
+      pushWebhook('download.done', { taskId, total: ids.length, ok: task.ok, failed: task.failed, results });
+    })
+    .catch((error) => {
+      task.status = 'error';
+      task.error = error.message;
+    });
+
+  return { taskId, total: ids.length };
 }
 
 async function handleApi(req, res, url) {
@@ -359,6 +821,10 @@ async function handleApi(req, res, url) {
   // 转写路由
   const trHandler = transcribeRoutes.get(`${method} ${route}`);
   if (trHandler) return await trHandler(req, res, url);
+
+  // 字幕检测路由
+  const subHandler = subtitleRoutes.get(`${method} ${route}`);
+  if (subHandler) return await subHandler(req, res, url);
 
   // 文案·评论·AI 路由（copy-api.mjs 挂载）
   const copyHandler = copyRoutes.get(`${method} ${route}`);
@@ -431,6 +897,32 @@ async function handleApi(req, res, url) {
     if (!browserHost?.paneText) return sendJson(res, 404, { error: '无' });
     return sendJson(res, 200, await browserHost.paneText());
   }
+
+  // 在内置浏览器面板页面执行 JS（下载按钮进度回显用；面板没开页面时报错）
+  if (method === 'POST' && route === '/api/browser/eval') {
+    if (!browserHost) return sendJson(res, 500, { error: '请从软件窗口启动' });
+    const body = await readBody(req);
+    const js = String(body.js || '');
+    if (!js) return sendJson(res, 400, { error: '缺少 js' });
+    try {
+      const out = await browserHost.paneEval(js);
+      return sendJson(res, 200, { ok: true, result: out });
+    } catch (error) {
+      return sendJson(res, 500, { error: error.message });
+    }
+  }
+
+  // 自检：在主界面窗口里执行 JS（读界面渲染结果用，临时开启，测完注释掉）
+  // if (method === 'POST' && route === '/api/debug/ui') {
+  //   if (!browserHost?.mainEval) return sendJson(res, 500, { error: '不支持' });
+  //   const body = await readBody(req);
+  //   try {
+  //     const out = await browserHost.mainEval(String(body.js || '1'));
+  //     return sendJson(res, 200, { ok: true, result: out });
+  //   } catch (error) {
+  //     return sendJson(res, 500, { error: error.message });
+  //   }
+  // }
 
   if (method === 'GET' && route === '/api/pane/shot') {
     if (!browserHost?.paneScreenshot) {
@@ -617,6 +1109,19 @@ async function handleApi(req, res, url) {
         result.lost = events.lost;
         result.canRestore = !!events.canRestore;
       }
+      // 登录成功（从未登录→已登录）：自动恢复该平台卡在 need_human 的任务，不用人点「继续」
+      if (events.backup) {
+        const stuck = listJobs(db).filter(
+          (j) => j.platform === events.backup && j.status === 'need_human'
+        );
+        if (stuck.length) {
+          const job = stuck[0]; // 一次恢复一个，跑完再看下一个
+          setTimeout(() => {
+            resumeJob(job.id).catch(() => {});
+          }, 2500);
+          result.autoResumedJob = job.id;
+        }
+      }
       if (events.backup) {
         result.backuped = events.backup;
         await loginGuard.doBackup(path.join(__dirname, 'data', 'login-backup')).catch(() => {});
@@ -641,11 +1146,82 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { has: loginGuard.hasBackup() });
   }
 
+  /**
+   * 下载内置浏览器「当前页」的视频（用户手动刷到的视频，一键无水印下载）。
+   * 流程：识别平台 → 在面板会话里跑现有去水印详情逻辑（collectOne / adapter.detail）
+   *      → 拿无水印直链 → downloadItem 正常下载入库（含旁车元信息）。
+   * 内核忙（采集任务进行中）时返回 409。
+   */
+  if (method === 'POST' && route === '/api/page/download') {
+    if (!browserHost) return sendJson(res, 500, { error: '请从软件窗口启动（Electron）' });
+    if (browserHost.isBusy?.()) return sendJson(res, 409, { error: 'BUSY', message: '采集任务运行中，等任务结束再试' });
+
+    const pageUrl = (await browserHost.paneState()).url || '';
+    const r = await downloadFromPaneUrl(pageUrl);
+    return sendJson(res, r.code, r.body);
+  }
+
+  /**
+   * 面板页面上注入按钮发起的下载请求队列：
+   * 轮询取走 window.__dlRequests → 逐个走无水印下载。
+   * 返回每个请求的下载任务状态（前端按钮据此显示进度）。
+   */
+  if (method === 'GET' && route === '/api/page/dl-requests') {
+    if (!browserHost?.takePaneDlRequests) return sendJson(res, 200, { items: [] });
+    const reqs = await browserHost.takePaneDlRequests();
+    const results = [];
+    for (const rq of reqs.slice(0, 3)) { // 一轮最多处理 3 个，防堆积
+      if (paneDlRunning.has(rq.url)) {
+        results.push({ url: rq.url, status: paneDlRunning.get(rq.url) });
+        continue;
+      }
+      // 后台跑，不阻塞轮询
+      paneDlRunning.set(rq.url, { status: 'working', percent: 0, startedAt: Date.now() });
+      // 超时兜底：等内核/等验证码时可能长时间没结果，
+      // 不给上限的话按钮会永远显示「解析中」，看着像卡死。
+      const PANE_DL_TIMEOUT_MS = 3 * 60 * 1000;
+      const guard = setTimeout(() => {
+        const cur = paneDlRunning.get(rq.url);
+        if (cur && cur.status === 'working') {
+          paneDlRunning.set(rq.url, {
+            status: 'error',
+            percent: 0,
+            note: '超时未完成（可能在内核排队或触发验证码），稍后重试',
+          });
+          setTimeout(() => paneDlRunning.delete(rq.url), 60 * 1000);
+        }
+      }, PANE_DL_TIMEOUT_MS);
+      guard.unref?.();
+      downloadFromPaneUrl(rq.url)
+        .then((r) => {
+          clearTimeout(guard);
+          paneDlRunning.set(rq.url, {
+            status: r.code === 200 ? 'done' : 'error',
+            percent: 100,
+            note: r.code === 200 ? (r.body.title || '') : (r.body.error || '失败'),
+            id: r.body.id,
+          });
+          // 成功保留 5 分钟（显示 ✓ 已下载）；失败保留 2 分钟后恢复可点
+          setTimeout(() => paneDlRunning.delete(rq.url), r.code === 200 ? 5 * 60 * 1000 : 2 * 60 * 1000);
+        })
+        .catch((e) => {
+          clearTimeout(guard);
+          paneDlRunning.set(rq.url, { status: 'error', percent: 0, note: e.message });
+          setTimeout(() => paneDlRunning.delete(rq.url), 60 * 1000);
+        });
+      results.push({ url: rq.url, status: 'queued' });
+    }
+    // 附上所有进行中/已完成的状态
+    const states = [];
+    for (const [url, st] of paneDlRunning) states.push({ url, ...st });
+    return sendJson(res, 200, { items: results, states });
+  }
+
   if (method === 'POST' && route === '/api/browser/open') {
     if (!browserHost) return sendJson(res, 500, { error: '请从软件窗口启动（Electron）' });
     const body = await readBody(req);
     const platform = body.platform;
-    const url = platform && PLATFORM_META[platform] ? PLATFORM_META[platform].homeUrl : 'about:blank';
+    const url = body.url || (platform && PLATFORM_META[platform] ? PLATFORM_META[platform].homeUrl : 'about:blank');
     // 只加载，不挂载视图——是否显示由界面决定，避免盖住功能页
     const r = await browserHost.paneNavigate(url);
     return sendJson(res, 200, { ok: true, url, visible: r?.visible === true });
@@ -803,6 +1379,7 @@ async function handleApi(req, res, url) {
       platform: q.get('platform') || '',
       keyword: q.get('keyword') || '',
       status: q.get('status') || '',
+      subtitle: q.get('subtitle') || '',
       q: q.get('q') || '',
       sort: q.get('sort') || 'new',
       limit: Math.min(Number(q.get('limit')) || 100, 500),
@@ -819,119 +1396,8 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     const ids = Array.isArray(body.ids) ? body.ids : [];
     if (!ids.length) return sendJson(res, 400, { error: '没有选中素材' });
-
-    const cookies = await browserCookies();
-    const queue = [...ids];
-    const results = [];
-    const workers = Math.max(1, Math.min(settings.concurrency, 6));
-    const taskId = `dq-${Date.now().toString(36)}`;
-    const task = { id: taskId, total: ids.length, done: 0, ok: 0, failed: 0, status: 'running', results, startedAt: Date.now() };
-    downloadTasks.set(taskId, task);
-
-    const runOne = async () => {
-      while (queue.length) {
-        const id = queue.shift();
-        let item = getItem(db, id);
-        if (!item) continue;
-        const dlId = createDownload(db, { itemId: id, url: item.video_url || item.page_url, engine: 'auto' });
-        const controller = new AbortController();
-        downloads.set(dlId, { controller });
-        let detailCtx = null;
-
-        try {
-          // 没直链先去浏览器里补一次（比 yt-dlp 靠得住）
-          if (!item.video_url && item.page_url) {
-            updateDownload(db, dlId, { status: 'downloading', engine: 'detail' });
-            detailCtx = await fetchDetailForItem(item, controller.signal);
-            if (detailCtx?.detail) {
-              const fresh = detailCtx.detail;
-              updateItem(db, id, {
-                video_url: fresh.video_url || '',
-                audio_url: fresh.audio_url || '',
-                author: fresh.author || item.author,
-                likes: fresh.likes || item.likes,
-                duration: fresh.duration || item.duration,
-                desc: fresh.desc || item.desc,
-                extra: fresh.extra || item.extra,
-              });
-              item = getItem(db, id);
-            }
-          }
-          // 直链会过期、候选链不落库：凡有详情上下文，用新鲜直链+备用源覆盖本次下载
-          if (detailCtx?.detail) {
-            const fresh = detailCtx.detail;
-            item = {
-              ...item,
-              video_url: fresh.video_url || item.video_url,
-              video_backups: fresh.video_backups || [],
-              audio_url: fresh.audio_url || item.audio_url,
-              audio_backups: fresh.audio_backups || [],
-            };
-          } else if (item.platform === 'bilibili' && item.video_url) {
-            // B站签名必过期：没有详情上下文就现取一个
-            detailCtx = await fetchDetailForItem(item, controller.signal);
-            if (detailCtx?.detail) {
-              const fresh = detailCtx.detail;
-              item = {
-                ...item,
-                video_url: fresh.video_url || item.video_url,
-                video_backups: fresh.video_backups || [],
-                audio_url: fresh.audio_url || item.audio_url,
-                audio_backups: fresh.audio_backups || [],
-              };
-            }
-          }
-
-          const inPageFetch = detailCtx?.tab
-            ? async (url, phase) => {
-                const buf = await detailCtx.tab.fetchBinaryInPage(url, {
-                  onProgress: (p) => onProgressUpdate(db, dlId, p, phase),
-                });
-                return buf;
-              }
-            : null;
-
-          const result = await downloadItem({
-            item,
-            outDir: settings.downloadDir,
-            cookies,
-            signal: controller.signal,
-            inPageFetch,
-            onProgress: (p) => onProgressUpdate(db, dlId, p, p.phase),
-          });
-          updateDownload(db, dlId, { status: 'done', dest: result.path, received: result.size, total: result.size, engine: result.engine });
-          updateItem(db, id, { status: 'done', local_path: result.path, local_size: result.size, error: '' });
-          results.push({ id, ok: true, path: result.path, engine: result.engine });
-          task.ok += 1;
-          task.done += 1;
-        } catch (error) {
-          updateDownload(db, dlId, { status: 'error', error: error.message });
-          updateItem(db, id, { status: 'error', error: error.message });
-          results.push({ id, ok: false, error: error.message });
-          task.failed += 1;
-          task.done += 1;
-        } finally {
-          if (detailCtx) {
-            await detailCtx.tab.closeTab().catch(() => {});
-            await detailCtx.base.destroy?.().catch(() => {});
-          }
-          downloads.delete(dlId);
-        }
-      }
-    };
-
-    Promise.all(Array.from({ length: workers }, runOne))
-      .then(() => {
-        task.status = 'done';
-        task.finishedAt = Date.now();
-        pushWebhook('download.done', { taskId, total: ids.length, ok: task.ok, failed: task.failed, results });
-      })
-      .catch((error) => {
-        task.status = 'error';
-        task.error = error.message;
-      });
-
-    return sendJson(res, 200, { ok: true, taskId, total: ids.length });
+    const started = await startItemDownload(ids);
+    return sendJson(res, 200, { ok: true, taskId: started.taskId, total: started.total });
   }
 
   if (method === 'GET' && route === '/api/download/task') {
@@ -952,6 +1418,33 @@ async function handleApi(req, res, url) {
     if (rec) rec.controller.abort();
     updateDownload(db, id, { status: 'cancelled' });
     return sendJson(res, 200, { ok: true });
+  }
+
+  /** 重试失败的下载：把 item 状态复位后重新走一次下载队列 */
+  if (method === 'POST' && route === '/api/download/retry') {
+    const body = await readBody(req);
+    const ids = Array.isArray(body.ids) && body.ids.length ? body.ids : [];
+    if (!ids.length) return sendJson(res, 400, { error: '没有要重试的下载' });
+    // 找到这些下载对应的 item，校验存在
+    const itemIds = [];
+    for (const dlId of ids) {
+      const dl = db.prepare('SELECT item_id, status FROM downloads WHERE id = ?').get(dlId);
+      if (dl && dl.item_id && ['error', 'cancelled'].includes(dl.status)) itemIds.push(dl.item_id);
+    }
+    if (!itemIds.length) return sendJson(res, 400, { error: '没有可重试的（只有失败/取消的能重试）' });
+    const started = await startItemDownload(itemIds);
+    return sendJson(res, 200, { ok: true, taskId: started.taskId, total: started.total });
+  }
+
+  /** 清理已完成的下载记录（只删 downloads 行，不动文件） */
+  if (method === 'POST' && route === '/api/download/clear-done') {
+    const body = await readBody(req).catch(() => ({}));
+    // includeError=1 时连失败/中断记录一起清
+    const sql = body?.includeError
+      ? "DELETE FROM downloads WHERE status IN ('done','cancelled','error')"
+      : "DELETE FROM downloads WHERE status IN ('done','cancelled')";
+    const info = db.prepare(sql).run();
+    return sendJson(res, 200, { ok: true, cleared: info.changes });
   }
 
   if (method === 'GET' && route === '/api/settings') {
@@ -1202,6 +1695,27 @@ mountTranscribe({
   getFreshDetail: fetchDetailForItem,
   getCookies: browserCookies,
   getOutDir: () => settings.downloadDir,
+});
+
+/* ---------- 字幕检测（抽帧判硬字幕，只拉小样不占空间） ---------- */
+const subtitleTasks = new Map(); // taskId -> 进度
+const subtitleAbort = new Map(); // taskId -> AbortController
+
+mountSubtitleApi({
+  app: {
+    sendJson,
+    readBody,
+    route: (m, p, h) => subtitleRoutes.set(`${m} ${p}`, h),
+  },
+  db,
+  settings,
+  pushWebhook,
+  tasks: subtitleTasks,
+  aborts: subtitleAbort,
+  getItem: (id) => getItem(db, id),
+  updateItem: (id, patch) => updateItem(db, id, patch),
+  getFreshDetail: fetchDetailForItem,
+  getCookies: browserCookies,
 });
 
 // 挂载文案·评论·AI 接口
